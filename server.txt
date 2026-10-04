@@ -1,0 +1,268 @@
+import express from 'express';
+import cors from 'cors';
+import crypto from 'node:crypto';
+import pg from 'pg';
+
+const { Pool } = pg;
+const PORT = Number(process.env.PORT || 3000);
+const PROTOCOL_VERSION = 3;
+const MAX_STATE_BYTES = 180000;
+const MAX_EVENTS_PER_SYNC = 100;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 180;
+const TOURNAMENT_BASE = { kill:100, steal:150, hatch:50, breed:120, defense:200 };
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && !/localhost|127\.0\.0\.1/.test(process.env.DATABASE_URL) ? {rejectUnauthorized:false} : false,
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
+
+const app = express();
+app.disable('x-powered-by');
+app.use(express.json({limit:'300kb'}));
+
+const origins = String(process.env.CORS_ORIGIN || '*').split(',').map(x=>x.trim()).filter(Boolean);
+app.use(cors({origin:(origin,cb)=>{
+  if(!origin || origins.includes('*') || origins.includes(origin)) return cb(null,true);
+  return cb(new Error('CORS origin not allowed'));
+}}));
+
+const buckets = new Map();
+function rateLimit(req,res,next){
+  const key = String(req.auth?.playerId || req.ip || 'anonymous');
+  const now=Date.now();
+  let b=buckets.get(key);
+  if(!b || now-b.startedAt>=RATE_LIMIT_WINDOW_MS){b={startedAt:now,count:0};buckets.set(key,b)}
+  b.count++;
+  if(b.count>RATE_LIMIT_MAX)return res.status(429).json({ok:false,error:'rate_limited'});
+  next();
+}
+
+function sha256(value){return crypto.createHash('sha256').update(value).digest('hex')}
+function token(){return crypto.randomBytes(32).toString('base64url')}
+function cleanText(v,max=200){return String(v??'').trim().slice(0,max)}
+function finiteInt(v,min=0,max=Number.MAX_SAFE_INTEGER){
+  const n=Number(v);
+  if(!Number.isFinite(n))return min;
+  return Math.min(max,Math.max(min,Math.floor(n)));
+}
+function jsonBytes(v){return Buffer.byteLength(JSON.stringify(v),'utf8')}
+
+function normalizePerks(p){
+  const src=(p&&typeof p==='object')?p:{};
+  return {
+    defense:finiteInt(src.defense,0,1_000_000),
+    agility:finiteInt(src.agility,0,1_000_000),
+    strength:finiteInt(src.strength,0,1_000_000),
+    intellect:finiteInt(src.intellect,0,1_000_000)
+  };
+}
+function normalizeBee(raw){
+  if(!raw || typeof raw!=='object')return null;
+  const sp=raw.sp==='Warrior'?'Warrior':'Collector';
+  const id=finiteInt(raw.id,1,1_000_000_000);
+  if(!id)return null;
+  const b={...raw};
+  b.id=id;
+  b.lv=finiteInt(raw.lv,1,50);
+  b.xp=finiteInt(raw.xp,0,1_000_000_000_000);
+  b.sp=sp;
+  b.hunger=finiteInt(raw.hunger,0,100000);
+  b.hungerMax=finiteInt(raw.hungerMax,1,100000);
+  b.perks=normalizePerks(raw.perks);
+  return b;
+}
+function normalizeState(input){
+  const src=(input&&typeof input==='object')?structuredClone(input):{};
+  const out=src;
+  out.nectar=finiteInt(src.nectar);
+  out.love=finiteInt(src.love);
+  out.bucks=finiteInt(src.bucks);
+  out.perkStones={
+    defense:finiteInt(src.perkStones?.defense,0,1_000_000),
+    agility:finiteInt(src.perkStones?.agility,0,1_000_000),
+    strength:finiteInt(src.perkStones?.strength,0,1_000_000),
+    intellect:finiteInt(src.perkStones?.intellect,0,1_000_000)
+  };
+  const used=new Set();
+  const normalizeList=(arr,max)=>{
+    if(!Array.isArray(arr))return [];
+    const result=[];
+    for(const raw of arr.slice(0,max)){
+      const b=normalizeBee(raw); if(!b || used.has(b.id))continue;
+      used.add(b.id); result.push(b);
+    }
+    return result;
+  };
+  out.bees=normalizeList(src.bees,500);
+  out.dead=normalizeList(src.dead,500).filter(b=>!out.bees.some(x=>x.id===b.id));
+  const maxId=Math.max(0,...out.bees.map(b=>b.id),...out.dead.map(b=>b.id));
+  out.nextId=finiteInt(src.nextId,1,1_000_000_001);
+  out.nextId=Math.max(out.nextId,maxId+1);
+  out.tournament=(src.tournament&&typeof src.tournament==='object')?src.tournament:{};
+  out.tournament.points=finiteInt(out.tournament.points,0,Number.MAX_SAFE_INTEGER);
+  out.tournament.seasonId=cleanText(out.tournament.seasonId,100);
+  if(out.online&&typeof out.online==='object'){
+    out.online.authToken=''; out.online.pending=[]; out.online.leaderboard=[]; out.online.status='offline';
+  }
+  if(jsonBytes(out)>MAX_STATE_BYTES)throw new Error('state_too_large');
+  return out;
+}
+
+async function dbInit(){
+  if(!process.env.DATABASE_URL)throw new Error('DATABASE_URL is required');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS players (
+      player_id TEXT PRIMARY KEY,
+      auth_hash TEXT NOT NULL UNIQUE,
+      email TEXT NOT NULL DEFAULT '',
+      nickname TEXT NOT NULL DEFAULT '',
+      anonymous_name TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS player_state (
+      player_id TEXT PRIMARY KEY REFERENCES players(player_id) ON DELETE CASCADE,
+      state_json JSONB NOT NULL,
+      version BIGINT NOT NULL DEFAULT 1,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS tournament_events (
+      event_id TEXT PRIMARY KEY,
+      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+      season_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS tournament_scores (
+      season_id TEXT NOT NULL,
+      player_id TEXT NOT NULL REFERENCES players(player_id) ON DELETE CASCADE,
+      points BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(season_id,player_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_tournament_scores ON tournament_scores(season_id,points DESC);
+  `);
+}
+
+const seasonStart = new Date('2026-10-01T00:00:00Z');
+function currentSeason(){
+  const now=Date.now();
+  const cycle=90*24*60*60*1000;
+  const index=Math.floor((now-seasonStart.getTime())/cycle);
+  const started=new Date(seasonStart.getTime()+Math.max(0,index)*cycle);
+  const ended=new Date(started.getTime()+cycle);
+  return {id:`2026-Q${Math.max(1,index+1)}`,startedAt:started.toISOString(),endsAt:ended.toISOString()};
+}
+
+async function auth(req,res,next){
+  const h=String(req.get('authorization')||'');
+  if(!h.startsWith('Bearer '))return res.status(401).json({ok:false,error:'unauthorized'});
+  const hash=sha256(h.slice(7));
+  const {rows}=await pool.query('SELECT player_id,email,nickname,anonymous_name FROM players WHERE auth_hash=$1 LIMIT 1',[hash]);
+  if(!rows[0])return res.status(401).json({ok:false,error:'invalid_token'});
+  req.auth={playerId:rows[0].player_id,profile:rows[0]};
+  next();
+}
+
+function protocol(req){return Number(req.body?.protocol ?? req.query?.protocol ?? 0)}
+function requireProtocol(req,res){
+  if(protocol(req)!==PROTOCOL_VERSION){res.status(400).json({ok:false,error:'unsupported_protocol',expected:PROTOCOL_VERSION});return false}
+  return true;
+}
+
+app.get('/health',async(req,res)=>{
+  try{await pool.query('SELECT 1');res.json({ok:true,service:'the-colony-online',protocol:PROTOCOL_VERSION,database:'postgres',time:new Date().toISOString()})}
+  catch(e){res.status(503).json({ok:false,error:'database_unavailable'})}
+});
+
+app.post('/v1/register',rateLimit,async(req,res)=>{
+  try{
+    if(!requireProtocol(req,res))return;
+    const playerId=cleanText(req.body.playerId,120);
+    if(!/^[A-Za-z0-9_-]{6,120}$/.test(playerId))return res.status(400).json({ok:false,error:'invalid_player_id'});
+    const email=cleanText(req.body.email,160);
+    const nickname=cleanText(req.body.nickname,24);
+    const anonymousName=cleanText(req.body.anonymousName,10);
+    const existing=await pool.query('SELECT player_id,auth_hash FROM players WHERE player_id=$1',[playerId]);
+    let authToken;
+    if(existing.rows[0]){
+      authToken=token();
+      await pool.query('UPDATE players SET auth_hash=$1,email=$2,nickname=$3,anonymous_name=$4,updated_at=NOW() WHERE player_id=$5',[sha256(authToken),email,nickname,anonymousName,playerId]);
+    }else{
+      authToken=token();
+      await pool.query('INSERT INTO players(player_id,auth_hash,email,nickname,anonymous_name) VALUES($1,$2,$3,$4,$5)',[playerId,sha256(authToken),email,nickname,anonymousName]);
+    }
+    const season=currentSeason();
+    res.json({ok:true,playerId,authToken,protocol:PROTOCOL_VERSION,season});
+  }catch(e){res.status(500).json({ok:false,error:'register_failed'})}
+});
+
+app.get('/v1/me',auth,rateLimit,async(req,res)=>{
+  res.json({ok:true,protocol:PROTOCOL_VERSION,player:req.auth.profile});
+});
+
+app.get('/v1/state',auth,rateLimit,async(req,res)=>{
+  try{
+    const {rows}=await pool.query('SELECT state_json,version,updated_at FROM player_state WHERE player_id=$1',[req.auth.playerId]);
+    if(!rows[0])return res.json({ok:true,hasState:false,protocol:PROTOCOL_VERSION});
+    res.json({ok:true,hasState:true,state:rows[0].state_json,version:Number(rows[0].version),updatedAt:rows[0].updated_at,protocol:PROTOCOL_VERSION});
+  }catch(e){res.status(500).json({ok:false,error:'state_read_failed'})}
+});
+
+app.put('/v1/state',auth,rateLimit,async(req,res)=>{
+  try{
+    if(!requireProtocol(req,res))return;
+    if(cleanText(req.body.playerId,120)!==req.auth.playerId)return res.status(403).json({ok:false,error:'player_mismatch'});
+    const state=normalizeState(req.body.state);
+    const {rows}=await pool.query(`
+      INSERT INTO player_state(player_id,state_json,version,updated_at) VALUES($1,$2,1,NOW())
+      ON CONFLICT(player_id) DO UPDATE SET state_json=EXCLUDED.state_json,version=player_state.version+1,updated_at=NOW()
+      RETURNING version,updated_at`,[req.auth.playerId,state]);
+    res.json({ok:true,version:Number(rows[0].version),updatedAt:rows[0].updated_at,protocol:PROTOCOL_VERSION});
+  }catch(e){res.status(400).json({ok:false,error:e.message==='state_too_large'?'state_too_large':'state_write_failed'})}
+});
+
+app.post('/v1/sync',auth,rateLimit,async(req,res)=>{
+  const client=await pool.connect();
+  try{
+    if(!requireProtocol(req,res))return;
+    if(cleanText(req.body.playerId,120)!==req.auth.playerId)return res.status(403).json({ok:false,error:'player_mismatch'});
+    const events=Array.isArray(req.body.events)?req.body.events.slice(0,MAX_EVENTS_PER_SYNC):[];
+    const season=currentSeason();
+    const accepted=[]; const duplicate=[];
+    await client.query('BEGIN');
+    for(const ev of events){
+      const eventId=cleanText(ev?.id,160);
+      const type=cleanText(ev?.type,30);
+      if(!eventId || !TOURNAMENT_BASE[type])continue;
+      const p=ev?.payload&&typeof ev.payload==='object'?ev.payload:{};
+      if(cleanText(p.seasonId,100)!==season.id)continue;
+      const bonus=finiteInt(p.bonusPercent,0,75);
+      const amount=Math.round(TOURNAMENT_BASE[type]*(1+bonus/100));
+      const ins=await client.query(`INSERT INTO tournament_events(event_id,player_id,season_id,event_type,amount) VALUES($1,$2,$3,$4,$5) ON CONFLICT(event_id) DO NOTHING`,[eventId,req.auth.playerId,season.id,type,amount]);
+      if(ins.rowCount===0){duplicate.push(eventId);continue;}
+      await client.query(`INSERT INTO tournament_scores(season_id,player_id,points) VALUES($1,$2,$3) ON CONFLICT(season_id,player_id) DO UPDATE SET points=tournament_scores.points+EXCLUDED.points,updated_at=NOW()`,[season.id,req.auth.playerId,amount]);
+      accepted.push(eventId);
+    }
+    await client.query('COMMIT');
+    res.json({ok:true,protocol:PROTOCOL_VERSION,season,accepted,duplicate});
+  }catch(e){try{await client.query('ROLLBACK')}catch{}res.status(400).json({ok:false,error:'sync_failed'})}
+  finally{client.release()}
+});
+
+app.get('/v1/tournament',rateLimit,async(req,res)=>{
+  try{
+    const season=currentSeason();
+    const {rows}=await pool.query(`SELECT s.player_id,s.points,p.nickname,p.anonymous_name FROM tournament_scores s JOIN players p ON p.player_id=s.player_id WHERE s.season_id=$1 ORDER BY s.points DESC, s.updated_at ASC LIMIT 100`,[season.id]);
+    res.json({ok:true,protocol:PROTOCOL_VERSION,season,leaderboard:rows.map((r,i)=>({rank:i+1,playerId:r.player_id,nickname:r.nickname,anonymousName:r.anonymous_name,points:Number(r.points)}))});
+  }catch(e){res.status(500).json({ok:false,error:'tournament_read_failed'})}
+});
+
+app.use((err,req,res,next)=>{if(err?.message==='CORS origin not allowed')return res.status(403).json({ok:false,error:'cors'});res.status(500).json({ok:false,error:'server_error'})});
+
+await dbInit();
+app.listen(PORT,'0.0.0.0',()=>console.log(`The Colony Online Server listening on ${PORT}, protocol ${PROTOCOL_VERSION}`));
